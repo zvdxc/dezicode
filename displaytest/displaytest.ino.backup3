@@ -1,0 +1,1033 @@
+/*******************************************************************
+    Hello World for the ESP32 Cheap Yellow Display.
+
+    https://github.com/witnessmenow/ESP32-Cheap-Yellow-Display
+
+    If you find what I do useful and would like to support me,
+    please consider becoming a sponsor on Github
+    https://github.com/sponsors/witnessmenow/
+
+    Written by Brian Lough
+    YouTube: https://www.youtube.com/brianlough
+    Twitter: https://twitter.com/witnessmenow
+ *******************************************************************/
+
+// Make sure to copy the UserSetup.h file into the library as
+// per the Github Instructions. The pins are defined in there.
+
+// Font 1. Original Adafruit 8 pixel font needs ~1820 bytes in FLASH
+// Font 2. Small 16 pixel high font, needs ~3534 bytes in FLASH, 96 characters
+// Font 4. Medium 26 pixel high font, needs ~5848 bytes in FLASH, 96 characters
+// Note the following larger fonts are primarily numeric only!
+// Font 6. Large 48 pixel font, needs ~2666 bytes in FLASH, only characters 1234567890:-.apm
+// Font 7. 7 segment 48 pixel font, needs ~2438 bytes in FLASH, only characters 1234567890:-.
+// Font 8. Large 75 pixel font needs ~3256 bytes in FLASH, only characters 1234567890:-.
+
+#include <Arduino.h>
+#include <FS.h>
+#include <SPI.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+
+// Preferences for saving settings
+Preferences preferences;
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+#include <EEPROM.h>
+#include <esp_now.h>
+#include <vector>
+#include <esp_wifi.h>
+#include "wifi_config.h"
+
+// Touch screen pins (CYD specific)
+#define XPT2046_IRQ 36
+#define XPT2046_MOSI 32
+#define XPT2046_MISO 39
+#define XPT2046_CLK 25
+#define XPT2046_CS 33
+
+// Initialize TFT display
+TFT_eSPI tft = TFT_eSPI();
+
+// Initialize SPI for touch controller
+SPIClass mySpi(HSPI);
+XPT2046_Touchscreen ts(XPT2046_CS, XPT2046_IRQ);
+
+// Create WiFi manager instance
+WiFiManager wifiManager;
+// Add these constants at the top of your file, after includes
+#define TS_MINX 150
+#define TS_MAXX 3600
+#define TS_MINY 200
+#define TS_MAXY 3700
+
+// Rest of your code...
+// Touch calibration values - adjust these based on your display
+#define TOUCH_MIN_X 150
+#define TOUCH_MAX_X 3600
+#define TOUCH_MIN_Y 200
+#define TOUCH_MAX_Y 3700
+
+// Touch debounce settings
+bool touchActive = false;
+unsigned long lastTouchTime = 0;
+const unsigned long TOUCH_DEBOUNCE_DELAY = 200; // 200ms debounce time
+
+// Screen states
+enum ScreenState {
+  MAIN_SCREEN,
+  SETTINGS_SCREEN,
+  WIFI_CONFIG_SCREEN,
+  ESP_NOW_SCAN_SCREEN,
+  ESP_NOW_DEVICE_SCREEN,
+  DEVICE_CONNECTED_SCREEN
+};
+ScreenState currentScreen = MAIN_SCREEN;
+
+// ESP-NOW device structure
+struct ESPNowDevice {
+  uint8_t mac[6];
+  String name;
+  int rssi;
+};
+
+// List of found ESP-NOW devices
+std::vector<ESPNowDevice> foundDevices;
+bool isScanning = false;
+unsigned long lastScanTime = 0;
+const unsigned long SCAN_INTERVAL = 5000; // 5 seconds between scans
+
+// WiFi state management
+bool wifiWasConnected = false;
+
+// Function to disable WiFi but keep ESP-NOW
+void disableWiFiKeepESPNow() {
+    // Save WiFi state before disconnecting
+    wifiWasConnected = (WiFi.status() == WL_CONNECTED);
+
+    // Disconnect and stop WiFi
+    WiFi.disconnect(true);
+    delay(100);
+
+    // Initialize WiFi in STA mode (required for ESP-NOW)
+    WiFi.mode(WIFI_STA);
+
+    // Initialize ESP-NOW
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("Error initializing ESP-NOW");
+        return;
+    }
+
+    // Set primary WiFi channel to match the ESP-NOW channel (channel 1)
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+}
+
+// Function to enable WiFi and ESP-NOW
+void enableWiFiAndESPNow() {
+    // Stop any existing WiFi
+    WiFi.disconnect(true);
+    delay(100);
+
+    // Start WiFi in station mode
+    WiFi.mode(WIFI_STA);
+
+    // Reconnect to WiFi if we were previously connected
+    if (wifiWasConnected) {
+        WiFi.reconnect();
+    }
+
+    // Initialize ESP-NOW if not already initialized
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("Error initializing ESP-NOW");
+        return;
+    }
+
+    // Set WiFi channel to auto (0) for normal WiFi operation
+    esp_wifi_set_channel(0, WIFI_SECOND_CHAN_NONE);
+
+    Serial.println("WiFi and ESP-NOW enabled");
+}
+
+// Function to restore WiFi if it was connected
+void restoreWiFiIfNeeded() {
+  if (wifiWasConnected) {
+    WiFi.reconnect();
+  }
+}
+
+// Settings screen button positions
+#define SETTINGS_BTN_X 0
+#define SETTINGS_BTN_Y 0
+#define SETTINGS_BTN_W 40
+#define SETTINGS_BTN_H 40
+
+// WiFi check interval (ms)
+const unsigned long WIFI_CHECK_INTERVAL = 10000;
+unsigned long lastWifiCheck = 0;
+
+// Button constants
+const int BUTTON_WIDTH = 200;
+const int BUTTON_HEIGHT = 40;
+const int BUTTON_START_Y = 80;
+const int BUTTON_MARGIN = 20;
+
+// Webhook settings
+const char* WEBHOOK_URL = "https://n8n.zvdxc.is-a.dev/webhook/getdecibel";
+
+// Function to save settings to preferences (kept for future use)
+void saveSettings() {
+  preferences.begin("settings", false);
+  // Add any settings you want to save in the future
+  preferences.end();
+}
+
+// Function to load settings from preferences (kept for future use)
+void loadSettings() {
+  preferences.begin("settings", true);
+  // Load any settings you need in the future
+  preferences.end();
+}
+
+// Decibel update interval (ms)
+const unsigned long DECIBEL_UPDATE_INTERVAL = 5000;
+unsigned long lastDecibelUpdate = 0;
+float currentDecibel = 0.0;
+
+// Check if a point is within a rectangle
+bool isInRect(int16_t x, int16_t y, int16_t rectX, int16_t rectY, int16_t rectW, int16_t rectH) {
+  return (x >= rectX) && (x < (rectX + rectW)) && (y >= rectY) && (y < (rectY + rectH));
+}
+void drawSettingsIcon(int16_t x, int16_t y, uint16_t color, uint16_t bgColor) {
+  // Draw a simple gear icon
+  tft.fillCircle(x + 8, y + 8, 8, color);
+  tft.fillCircle(x + 8, y + 8, 4, bgColor);
+
+  // Draw gear teeth
+  for (int i = 0; i < 8; i++) {
+    float angle = i * PI / 4;
+    int x1 = x + 8 + (int)(5 * cos(angle));
+    int y1 = y + 8 + (int)(5 * sin(angle));
+    int x2 = x + 8 + (int)(8 * cos(angle));
+    int y2 = y + 8 + (int)(8 * sin(angle));
+    tft.drawLine(x1, y1, x2, y2, color);
+  }
+}
+// Function to draw the settings screen
+void drawSettingsScreen() {
+  tft.fillScreen(TFT_WHITE);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+
+  // Title
+  tft.drawCentreString("Settings", tft.width()/2, 10, 4);
+
+  int yPos = BUTTON_START_Y;
+
+  // WiFi Setup Button
+  tft.drawRect((tft.width() - BUTTON_WIDTH) / 2, yPos, BUTTON_WIDTH, BUTTON_HEIGHT, TFT_BLUE);
+  tft.setTextColor(TFT_WHITE, TFT_BLUE);
+  tft.fillRect((tft.width() - BUTTON_WIDTH) / 2 + 1, yPos + 1, BUTTON_WIDTH - 2, BUTTON_HEIGHT - 2, TFT_BLUE);
+  tft.drawCentreString("WiFi Setup", tft.width()/2, yPos + (BUTTON_HEIGHT/2) - 8, 2);
+  yPos += BUTTON_HEIGHT + BUTTON_MARGIN;
+
+  // ESP-NOW Setup Button
+  tft.drawRect((tft.width() - BUTTON_WIDTH) / 2, yPos, BUTTON_WIDTH, BUTTON_HEIGHT, TFT_DARKGREEN);
+  tft.setTextColor(TFT_WHITE, TFT_DARKGREEN);
+  tft.fillRect((tft.width() - BUTTON_WIDTH) / 2 + 1, yPos + 1, BUTTON_WIDTH - 2, BUTTON_HEIGHT - 2, TFT_DARKGREEN);
+  tft.drawCentreString("Setup Transmitter", tft.width()/2, yPos + (BUTTON_HEIGHT/2) - 8, 2);
+  yPos += BUTTON_HEIGHT + BUTTON_MARGIN;
+
+  // Status message
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.drawCentreString("Using n8n Webhook", tft.width()/2, yPos + (BUTTON_HEIGHT/2) - 8, 2);
+  yPos += BUTTON_HEIGHT + BUTTON_MARGIN * 2;
+
+  // Exit button (bottom of screen)
+  tft.drawRect((tft.width() - BUTTON_WIDTH) / 2, tft.height() - BUTTON_HEIGHT - 10, BUTTON_WIDTH, BUTTON_HEIGHT, TFT_RED);
+  tft.fillRect((tft.width() - BUTTON_WIDTH) / 2 + 1, tft.height() - BUTTON_HEIGHT - 9, BUTTON_WIDTH - 2, BUTTON_HEIGHT - 2, TFT_RED);
+  tft.setTextColor(TFT_WHITE, TFT_RED);
+  tft.drawCentreString("EXIT", tft.width()/2, tft.height() - BUTTON_HEIGHT - 10 + (BUTTON_HEIGHT/2) - 8, 2);
+
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+}
+
+void drawWiFiConfigScreen() {
+  tft.fillScreen(TFT_WHITE);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+
+  // Title
+  tft.drawCentreString("WiFi Setup", tft.width()/2, 10, 4);
+
+  // Instructions
+  tft.drawString("1. Connect to WiFi:", 10, 50, 2);
+  tft.drawString("SSID: " + WiFi.softAPSSID(), 20, 70, 2);
+  tft.drawString("2. Open browser to:", 10, 100, 2);
+  tft.drawString("http://192.168.4.1", 20, 120, 2);
+  tft.drawString("3. Configure WiFi settings", 10, 140, 2);
+
+  // Back button
+  tft.drawRect(90, 180, 140, 40, TFT_BLUE);
+  tft.setTextColor(TFT_BLUE, TFT_WHITE);
+  tft.drawCentreString("BACK", tft.width()/2, 190, 2);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setTextColor(TFT_BLUE, TFT_WHITE);
+  tft.drawCentreString("BACK", tft.width()/2, 170, 2);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+}
+
+
+// Fetch decibel value from n8n webhook
+bool fetchDecibelValueN8N() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Not connected to WiFi");
+    return false;
+  }
+
+  HTTPClient http;
+  bool success = false;
+
+  // Initialize HTTP client
+  http.begin("https://n8n.zvdxc.is-a.dev/webhook/getdecibel");
+  http.setTimeout(5000); // 5 second timeout
+
+  // Send HTTP GET request
+  int httpResponseCode = http.GET();
+
+  if (httpResponseCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    payload.trim();
+
+    // Try to convert response to float
+    float newValue = payload.toFloat();
+    if (newValue > 0) {
+      currentDecibel = newValue;
+      success = true;
+      Serial.print("Updated decibel value: ");
+      Serial.println(currentDecibel, 1);
+    } else {
+      Serial.println("Invalid decibel value received");
+    }
+  } else {
+    Serial.print("HTTP request failed, error: ");
+    Serial.println(http.errorToString(httpResponseCode).c_str());
+  }
+
+  http.end();
+  return success;
+}
+
+void drawMainScreen() {
+  tft.fillScreen(TFT_WHITE);
+
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  int fontNum = 8;  // Using Font 8 for the large number
+  String numberText = String(currentDecibel, 1); // Show 1 decimal place
+
+  // Calculate text dimensions
+  int textWidth = tft.textWidth(numberText, fontNum);
+  int textHeight = 75; // Font 8 is 75 pixels high
+
+  // Calculate x and y coordinates to center the main number with the "db" text
+  int dbFontNum = 4; // Smaller font for "db"
+  String dbText = " db";
+  int dbTextWidth = tft.textWidth(dbText, dbFontNum);
+
+  // Calculate the total width of number + "db"
+  int totalWidth = textWidth + dbTextWidth;
+
+  // Calculate starting x position to center the whole text
+  int x = (tft.width() - totalWidth) / 2;
+  int y = (tft.height() - textHeight) / 2;
+
+  // Draw the number and "db" text
+  tft.drawString(numberText, x, y, fontNum);
+  tft.drawString(dbText, x + textWidth, y + textHeight - 20, dbFontNum);
+
+  // Draw settings icon in top-left corner
+  drawSettingsIcon(SETTINGS_BTN_X, SETTINGS_BTN_Y, TFT_BLACK, TFT_WHITE);
+
+  // Show WiFi status
+  tft.setTextColor(TFT_BLUE, TFT_WHITE);
+  String wifiStatus = wifiManager.isAPMode() ? "AP Mode" :
+                     (wifiManager.isConnected() ? WiFi.localIP().toString() : "No WiFi");
+  tft.drawString(wifiStatus, 10, tft.height() - 20, 2);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+}
+// Function declarations
+void drawESPNowDeviceList();
+void startESPNowScan();
+// Currently connected device
+ESPNowDevice* connectedDevice = nullptr;
+unsigned long lastConnectionTime = 0;
+const unsigned long CONNECTION_TIMEOUT = 10000; // 10 seconds timeout
+bool isConnected = false;
+
+void showDeviceOptions(int deviceIndex) {
+  if (deviceIndex < 0 || deviceIndex >= foundDevices.size()) {
+    return;
+  }
+
+  // Store the selected device
+  if (connectedDevice) {
+    delete connectedDevice;
+  }
+  connectedDevice = new ESPNowDevice(foundDevices[deviceIndex]);
+
+  currentScreen = ESP_NOW_DEVICE_SCREEN;
+
+  tft.fillScreen(TFT_WHITE);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+
+  // Device header
+  tft.drawCentreString("Device Options", tft.width()/2, 10, 4);
+
+  // Device info
+  tft.drawString("Name: " + connectedDevice->name, 20, 50, 2);
+  tft.drawString("RSSI: " + String(connectedDevice->rssi) + " dBm", 20, 80, 2);
+
+  // Format MAC address
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           connectedDevice->mac[0], connectedDevice->mac[1], connectedDevice->mac[2],
+           connectedDevice->mac[3], connectedDevice->mac[4], connectedDevice->mac[5]);
+  tft.drawString("MAC: " + String(macStr), 20, 110, 2);
+
+  // Action buttons
+  int buttonY = 150;
+
+  // Connect button
+  tft.drawRect(40, buttonY, 240, 35, TFT_GREEN);
+  tft.fillRect(41, buttonY + 1, 238, 33, TFT_GREEN);
+  tft.setTextColor(TFT_WHITE, TFT_GREEN);
+  tft.drawCentreString("Connect to Device", tft.width()/2, buttonY + 10, 2);
+
+  buttonY += 45;
+
+  // Back button
+  tft.drawRect(40, buttonY, 240, 35, TFT_RED);
+  tft.fillRect(41, buttonY + 1, 238, 33, TFT_RED);
+  tft.setTextColor(TFT_WHITE, TFT_RED);
+  tft.drawCentreString("Back to List", tft.width()/2, buttonY + 10, 2);
+
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+}
+
+void connectToDevice(ESPNowDevice& device) {
+  // Store the connected device
+  if (connectedDevice) {
+    delete connectedDevice;
+  }
+  connectedDevice = new ESPNowDevice(device);
+
+  // Disable WiFi but keep ESP-NOW
+  disableWiFiKeepESPNow();
+
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
+
+  // Register callback for data reception
+  esp_now_register_recv_cb(OnDataRecv);
+
+  // Add peer
+  esp_now_peer_info_t peerInfo;
+  memcpy(peerInfo.peer_addr, device.mac, 6);
+  peerInfo.channel = 1; // Use channel 1 for ESP-NOW
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add peer");
+    return;
+  }
+
+  // Set connection state
+  isConnected = true;
+  lastConnectionTime = millis();
+
+  Serial.println("Connected to device");
+
+  // Show connected device screen
+  showConnectedDeviceScreen();
+}
+
+void showConnectedDeviceScreen() {
+  if (!connectedDevice) return;
+
+  currentScreen = DEVICE_CONNECTED_SCREEN;
+  tft.fillScreen(TFT_WHITE);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+
+  // Header
+  tft.drawCentreString("Connected Device", tft.width()/2, 20, 4);
+
+  // Device info
+  tft.drawString("Name: " + connectedDevice->name, 20, 60, 2);
+
+  // Format MAC address
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           connectedDevice->mac[0], connectedDevice->mac[1], connectedDevice->mac[2],
+           connectedDevice->mac[3], connectedDevice->mac[4], connectedDevice->mac[5]);
+  tft.drawString("MAC: " + String(macStr), 20, 90, 2);
+
+  // Connection status
+  updateConnectionStatus();
+
+  // Last seen
+  tft.drawString("Last seen: ", 20, 150, 2);
+
+  // Back button
+  int buttonY = tft.height() - 60;
+  tft.drawRect(40, buttonY, 240, 40, TFT_RED);
+  tft.fillRect(41, buttonY + 1, 238, 38, TFT_RED);
+  tft.setTextColor(TFT_WHITE, TFT_RED);
+  tft.drawCentreString("Disconnect", tft.width()/2, buttonY + 12, 2);
+
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+}
+
+void updateConnectionStatus() {
+  if (!connectedDevice) return;
+
+  // Check connection timeout
+  if (isConnected && (millis() - lastConnectionTime > CONNECTION_TIMEOUT)) {
+    isConnected = false;
+    tft.fillRect(20, 120, 200, 20, TFT_WHITE);
+    tft.setTextColor(TFT_RED, TFT_WHITE);
+    tft.drawString("Status: Disconnected", 20, 120, 2);
+    return;
+  }
+
+  // Update last seen time
+  unsigned long secondsAgo = (millis() - lastConnectionTime) / 1000;
+  char timeStr[20];
+  if (secondsAgo < 60) {
+    snprintf(timeStr, sizeof(timeStr), "%lu seconds ago", secondsAgo);
+  } else {
+    snprintf(timeStr, sizeof(timeStr), "%lu minutes ago", secondsAgo / 60);
+  }
+
+  tft.fillRect(100, 150, 200, 20, TFT_WHITE);
+  tft.drawString(timeStr, 100, 150, 2);
+
+  // Update connection status
+  tft.fillRect(20, 120, 200, 20, TFT_WHITE);
+  tft.setTextColor(isConnected ? TFT_GREEN : TFT_RED, TFT_WHITE);
+  tft.drawString(isConnected ? "Status: Connected" : "Status: Disconnected", 20, 120, 2);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+}
+
+// ESP-NOW receive callback
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int data_len) {
+  if (!info || !data || data_len <= 0) return;
+
+  // Update last connection time when receiving data
+  if (connectedDevice && memcmp(connectedDevice->mac, info->src_addr, 6) == 0) {
+    lastConnectionTime = millis();
+    if (!isConnected) {
+      isConnected = true;
+      if (currentScreen == DEVICE_CONNECTED_SCREEN) {
+        updateConnectionStatus();
+      }
+    }
+  }
+}
+
+// ESP-NOW scan callback
+void onScanDone(arduino_event_id_t event, arduino_event_info_t info) {
+  isScanning = false;
+  foundDevices.clear();
+
+  // Get scan results
+  int16_t count = WiFi.scanComplete();
+  Serial.print("Scan complete. Found networks: ");
+  Serial.println(count);
+
+  if (count < 0) {
+    Serial.println("No scan results available");
+    return;
+  }
+
+  bool foundDeziDuino = false;
+
+  // Print all found networks for debugging
+  for (int i = 0; i < count; i++) {
+    String ssid = WiFi.SSID(i);
+    String bssid = WiFi.BSSIDstr(i);
+    int32_t rssi = WiFi.RSSI(i);
+
+    // Print network info
+    Serial.printf("Network %d: SSID: '%s', BSSID: %s, RSSI: %d\n",
+                 i, ssid.c_str(), bssid.c_str(), rssi);
+
+    // Check if this is a DeziDuino device (case insensitive check)
+    if (ssid.length() > 0) {  // Only process non-hidden networks
+      String ssidUpper = ssid;
+      ssidUpper.toUpperCase();
+
+      // Look for DeziDuino or ESP devices
+      if (ssidUpper.startsWith("DEZIDUINO") || ssidUpper.startsWith("ESP")) {
+        ESPNowDevice device;
+
+        // Parse MAC address from BSSID string (format: "XX:XX:XX:XX:XX:XX")
+        uint8_t mac[6];
+        if (sscanf(bssid.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                  &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]) == 6) {
+          memcpy(device.mac, mac, 6);
+          device.name = ssid;  // Keep original case for display
+          device.rssi = rssi;
+          foundDevices.push_back(device);
+          foundDeziDuino = true;
+
+          // Debug output
+          char macStr[18];
+          snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+          Serial.printf("-> Found ESP-NOW device: %s (%s) %d dBm\n",
+                       ssid.c_str(), macStr, rssi);
+        }
+      }
+    }
+  }
+
+  if (!foundDeziDuino) {
+    Serial.println("No DeziDuino devices found in scan results");
+  }
+
+  // If we're on the ESP-NOW scan screen, update the display
+  if (currentScreen == ESP_NOW_SCAN_SCREEN) {
+    drawESPNowDeviceList();
+  }
+
+  // Try to restore WiFi connection if needed
+  if (wifiWasConnected) {
+    Serial.println("Attempting to restore WiFi connection...");
+    WiFi.reconnect();
+  }
+}
+
+// Draw the list of found ESP-NOW devices
+void drawESPNowDeviceList() {
+  tft.fillScreen(TFT_WHITE);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.drawCentreString("Select Device", tft.width()/2, 10, 4);
+
+  if (foundDevices.empty()) {
+    tft.drawCentreString("No devices found", tft.width()/2, 50, 2);
+    tft.drawCentreString("Scanning...", tft.width()/2, 80, 2);
+  } else {
+    // Display found devices (up to 4 to fit on screen with spacing)
+    for (int i = 0; i < foundDevices.size() && i < 4; i++) {
+      int y = 40 + (i * 45);
+
+      // Draw device button
+      tft.drawRect(20, y, tft.width() - 40, 40, TFT_BLUE);
+      tft.fillRect(21, y + 1, tft.width() - 42, 38, TFT_WHITE);
+
+      // Device name and signal strength
+      String deviceStr = foundDevices[i].name;
+      String rssiStr = String(foundDevices[i].rssi) + " dBm";
+
+      tft.setTextColor(TFT_BLUE, TFT_WHITE);
+      tft.drawString(deviceStr, 30, y + 10, 2);
+      tft.setTextColor(TFT_DARKGREY, TFT_WHITE);
+      tft.drawString(rssiStr, 30, y + 25, 1);
+
+      // Draw arrow
+      tft.fillTriangle(tft.width() - 30, y + 15,
+                      tft.width() - 20, y + 20,
+                      tft.width() - 30, y + 25, TFT_BLUE);
+    }
+  }
+
+  // Back button (bottom left)
+  tft.drawRect(20, tft.height() - 50, 120, 35, TFT_RED);
+  tft.setTextColor(TFT_RED, TFT_WHITE);
+  tft.drawCentreString("BACK", 80, tft.height() - 40, 2);
+
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+}
+
+// Start ESP-NOW device scan
+void startESPNowScan() {
+  if (isScanning) {
+    Serial.println("Scan already in progress");
+    return;
+  }
+
+  isScanning = true;
+  foundDevices.clear();
+
+  // Save current WiFi state
+  bool wasConnected = (WiFi.status() == WL_CONNECTED);
+  String currentSSID = WiFi.SSID();
+  String currentPSK = "";  // Can't retrieve PSK, will need to reconnect manually
+
+  // Disconnect WiFi but keep the configuration
+  WiFi.disconnect(false);
+  delay(100);
+
+  // Set WiFi to station mode
+  WiFi.mode(WIFI_STA);
+
+  // Configure WiFi to channel 1
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  // Register scan done callback
+  WiFi.onEvent(onScanDone, ARDUINO_EVENT_WIFI_SCAN_DONE);
+
+  // Start the scan
+  Serial.println("Starting network scan on channel 1...");
+  bool scanStarted = WiFi.scanNetworks(true, true, false, 500, 1);
+
+  if (!scanStarted) {
+    Serial.println("Failed to start scan");
+    isScanning = false;
+
+    // Try to restore WiFi connection
+    if (wasConnected) {
+      WiFi.begin(currentSSID.c_str(), currentPSK.c_str());
+    }
+    return;
+  }
+
+  // Show scanning screen
+  currentScreen = ESP_NOW_SCAN_SCREEN;
+  tft.fillScreen(TFT_WHITE);
+  tft.drawCentreString("Scanning...", tft.width()/2, 50, 2);
+  Serial.println("Scan started on channel 1");
+}
+
+// First loop() function removed - using the more complete version below
+        }
+      } else if (currentScreen == SETTINGS_SCREEN) {
+        // WiFi Setup button
+        if (isInRect(touchX, touchY, 40, 40, 240, 35)) {
+          currentScreen = WIFI_CONFIG_SCREEN;
+          wifiManager.startAP();
+          drawWiFiConfigScreen();
+        }
+        // ESP-NOW Setup button
+        else if (isInRect(touchX, touchY, 40, 85, 240, 35)) {
+          disableWiFiKeepESPNow();
+          startESPNowScan();
+        }
+        // Exit button - will trigger reboot
+        else if (isInRect(touchX, touchY, 40, 200, 240, 35)) {
+          tft.fillScreen(TFT_WHITE);
+          tft.setTextColor(TFT_BLACK, TFT_WHITE);
+          tft.drawCentreString("Saving settings...", tft.width()/2, tft.height()/2 - 20, 2);
+          tft.drawCentreString("Rebooting...", tft.width()/2, tft.height()/2 + 10, 2);
+          saveSettings();
+          delay(1000);
+          ESP.restart();
+        }
+      } else if (currentScreen == WIFI_CONFIG_SCREEN) {
+        // Back button
+        if (isInRect(touchX, touchY, 40, 160, 240, 40)) {
+          currentScreen = SETTINGS_SCREEN;
+          drawSettingsScreen();
+        }
+      } else if (currentScreen == ESP_NOW_DEVICE_SCREEN) {
+        // Connect button
+        if (isInRect(touchX, touchY, 40, 150, 240, 35)) {
+          // Connect to the selected device
+          if (!foundDevices.empty()) {
+            // Find which device is selected
+            for (int i = 0; i < foundDevices.size(); i++) {
+              if (foundDevices[i].name == connectedDevice->name) {
+                connectToDevice(foundDevices[i]);
+                break;
+              }
+            }
+          }
+        }
+        // Back button
+        else if (isInRect(touchX, touchY, 40, 200, 240, 35)) {
+          currentScreen = ESP_NOW_SCAN_SCREEN;
+          drawESPNowDeviceList();
+        }
+      } else if (currentScreen == ESP_NOW_SCAN_SCREEN) {
+        // Handle device selection
+        if (!foundDevices.empty()) {
+          for (int i = 0; i < foundDevices.size() && i < 4; i++) {
+            int y = 40 + (i * 45);
+            if (isInRect(touchX, touchY, 20, y, tft.width() - 40, 40)) {
+              showDeviceOptions(i);
+              break;
+            }
+          }
+        }
+
+        // Back button (bottom left)
+        if (isInRect(touchX, touchY, 20, tft.height() - 50, 120, 35)) {
+          currentScreen = SETTINGS_SCREEN;
+          drawSettingsScreen();
+        }
+      } else if (currentScreen == DEVICE_CONNECTED_SCREEN) {
+        // Disconnect button
+        if (isInRect(touchX, touchY, 40, tft.height() - 60, 240, 40)) {
+          // Disconnect from device
+          if (connectedDevice) {
+            delete connectedDevice;
+            connectedDevice = nullptr;
+          }
+          currentScreen = SETTINGS_SCREEN;
+          drawSettingsScreen();
+        }
+      }
+    }
+  } else if (!isTouched) {
+    // Touch released
+    touchActive = false;
+  }
+
+  // Update connection status if on the connected device screen
+  static unsigned long lastUpdate = 0;
+  if (currentScreen == DEVICE_CONNECTED_SCREEN && connectedDevice) {
+    if (millis() - lastUpdate > 1000) { // Update every second
+      updateConnectionStatus();
+      lastUpdate = millis();
+    }
+  }
+
+  // Handle WiFi client in AP mode
+  if (currentScreen == WIFI_CONFIG_SCREEN) {
+    wifiManager.handleClient();
+  } else if (currentScreen == SETTINGS_SCREEN || currentScreen == ESP_NOW_SCAN_SCREEN) {
+    // If we're in settings or ESP-NOW scan, make sure WiFi is disabled
+    if (WiFi.status() == WL_CONNECTED) {
+      disableWiFiKeepESPNow();
+    }
+  // Handle other screens
+  if (currentScreen == MAIN_SCREEN) {
+    // Update main screen if needed
+    static unsigned long lastUpdate = 0;
+    if (millis() - lastUpdate > 1000) {
+      // Update time or other dynamic content
+      lastUpdate = millis();
+    }
+  }
+
+  // Periodically check WiFi status, but only if we're on the main screen
+  unsigned long currentTime = millis();
+  if (currentTime - lastWifiCheck > WIFI_CHECK_INTERVAL) {
+    // Only attempt to reconnect if we're on the main screen
+    if (currentScreen == MAIN_SCREEN && wifiManager.isConfigured() && !wifiManager.isAPMode()) {
+      if (WiFi.status() != WL_CONNECTED) {
+        bool connected = wifiManager.connect();
+        if (connected) {
+          Serial.println("Reconnected to WiFi");
+          drawMainScreen();
+        } else {
+          Serial.println("Failed to reconnect to WiFi");
+        }
+      }
+    }
+    lastWifiCheck = currentTime;
+  }
+}
+
+
+void setup() {
+  // Initialize serial communication
+  Serial.begin(115200);
+  while (!Serial); // Wait for serial port to connect
+
+  // Initialize display
+  tft.init();
+  tft.setRotation(1); // Landscape mode
+  tft.fillScreen(TFT_WHITE);
+  tft.setTextColor(TFT_BLACK, TFT_WHITE);
+  tft.setTextSize(1);
+
+  // Initialize touch controller
+  mySpi.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  ts.begin(mySpi);
+  ts.setRotation(1);  // Match display rotation
+
+  // Try to connect to WiFi if configured
+  tft.drawCentreString("Connecting to WiFi...", tft.width()/2, 50, 2);
+  if (wifiManager.isConfigured()) {
+    if (wifiManager.connect()) {
+      tft.drawCentreString("Connected to WiFi!", tft.width()/2, 70, 2);
+      Serial.println("Connected to WiFi");
+      Serial.print("IP Address: ");
+      Serial.println(WiFi.localIP());
+
+      // Initialize ESP-NOW after WiFi is connected
+      if (esp_now_init() != ESP_OK) {
+        Serial.println("Error initializing ESP-NOW");
+      } else {
+        Serial.println("ESP-NOW initialized");
+      }
+    } else {
+      tft.drawCentreString("WiFi Connect Failed", tft.width()/2, 70, 2);
+      Serial.println("WiFi connection failed");
+
+      // Still try to initialize ESP-NOW even if WiFi connection failed
+      if (esp_now_init() != ESP_OK) {
+        Serial.println("Error initializing ESP-NOW");
+      } else {
+        Serial.println("ESP-NOW initialized (WiFi failed)");
+      }
+    }
+  } else {
+    tft.drawCentreString("No WiFi Config", tft.width()/2, 70, 2);
+    Serial.println("No WiFi configuration found");
+
+    // Initialize ESP-NOW even without WiFi config
+    if (esp_now_init() != ESP_OK) {
+      Serial.println("Error initializing ESP-NOW");
+    } else {
+      Serial.println("ESP-NOW initialized (no WiFi config)");
+    }
+  }
+
+  // Draw the initial screen
+  delay(1000); // Show status messages for a moment
+  drawMainScreen();
+
+  Serial.println("Setup complete - Touch the screen to test");
+  lastWifiCheck = millis();
+}
+
+void loop() {
+  // Update decibel value periodically, but only on the main screen
+  if (currentScreen == MAIN_SCREEN && WiFi.status() == WL_CONNECTED) {
+    if (millis() - lastDecibelUpdate >= DECIBEL_UPDATE_INTERVAL) {
+      if (fetchDecibelValueN8N()) {
+        drawMainScreen();
+      } else {
+        Serial.println("Failed to fetch decibel value from webhook");
+      }
+      lastDecibelUpdate = millis();
+    }
+  }
+
+  // Check WiFi connection status periodically
+  if (millis() - lastWifiCheck >= WIFI_CHECK_INTERVAL) {
+    if (WiFi.status() != WL_CONNECTED && currentScreen != WIFI_CONFIG_SCREEN) {
+      Serial.println("WiFi disconnected, trying to reconnect...");
+      if (WiFi.reconnect()) {
+        Serial.println("Successfully reconnected to WiFi");
+        drawMainScreen();
+      } else {
+        Serial.println("Failed to reconnect to WiFi");
+      }
+    }
+    lastWifiCheck = millis();
+  }
+
+  // Update connection status if on the connected device screen
+  if (currentScreen == DEVICE_CONNECTED_SCREEN) {
+    updateConnectionStatus();
+  }
+
+  // Handle touch input
+  if (ts.tirqTouched() && ts.touched()) {
+    TS_Point p = ts.getPoint();
+
+    // Map touch coordinates to screen coordinates (adjust these values based on your calibration)
+    int16_t touchX = map(p.x, TS_MINX, TS_MAXX, 0, tft.width());
+    int16_t touchY = map(p.y, TS_MINY, TS_MAXY, 0, tft.height());
+
+    // Debug output
+    Serial.print("Touch at X = ");
+    Serial.print(touchX);
+    Serial.print(", Y = ");
+    Serial.println(touchY);
+
+    // Handle touch based on current screen
+    if (currentScreen == MAIN_SCREEN) {
+      // Check if settings icon was touched
+      if (isInRect(touchX, touchY, tft.width() - 40, 0, 40, 40)) {
+        currentScreen = SETTINGS_SCREEN;
+        drawSettingsScreen();
+      }
+    } else if (currentScreen == SETTINGS_SCREEN) {
+      // Back button
+      if (isInRect(touchX, touchY, 20, tft.height() - 50, 120, 35)) {
+        currentScreen = MAIN_SCREEN;
+        drawMainScreen();
+      }
+      // WiFi Config button
+      else if (isInRect(touchX, touchY, 40, 80, 240, 40)) {
+        currentScreen = WIFI_CONFIG_SCREEN;
+        drawWiFiConfigScreen();
+      }
+      // ESP-NOW Scan button
+      else if (isInRect(touchX, touchY, 40, 140, 240, 40)) {
+        startESPNowScan();
+      }
+    } else if (currentScreen == WIFI_CONFIG_SCREEN) {
+      // Back button
+      if (isInRect(touchX, touchY, 20, tft.height() - 50, 120, 35)) {
+        currentScreen = SETTINGS_SCREEN;
+        drawSettingsScreen();
+      }
+    } else if (currentScreen == ESP_NOW_DEVICE_SCREEN) {
+      // Connect button
+      if (isInRect(touchX, touchY, 40, 150, 240, 35)) {
+        // Connect to the selected device
+        if (!foundDevices.empty()) {
+          // Find which device is selected
+          for (int i = 0; i < foundDevices.size(); i++) {
+            if (foundDevices[i].name == connectedDevice->name) {
+              connectToDevice(foundDevices[i]);
+              break;
+            }
+          }
+        }
+      }
+      // Back button
+      else if (isInRect(touchX, touchY, 40, 200, 240, 35)) {
+        currentScreen = ESP_NOW_SCAN_SCREEN;
+        drawESPNowDeviceList();
+      }
+    } else if (currentScreen == ESP_NOW_SCAN_SCREEN) {
+      // Handle device selection
+      if (!foundDevices.empty()) {
+        for (int i = 0; i < foundDevices.size() && i < 4; i++) {
+          int y = 40 + (i * 45);
+          if (isInRect(touchX, touchY, 20, y, tft.width() - 40, 40)) {
+            showDeviceOptions(i);
+            break;
+          }
+        }
+      }
+
+      // Back button (bottom left)
+      if (isInRect(touchX, touchY, 20, tft.height() - 50, 120, 35)) {
+        currentScreen = SETTINGS_SCREEN;
+        drawSettingsScreen();
+      }
+    } else if (currentScreen == DEVICE_CONNECTED_SCREEN) {
+      // Disconnect button
+      if (isInRect(touchX, touchY, 40, tft.height() - 60, 240, 40)) {
+        // Disconnect from device
+        if (connectedDevice) {
+          delete connectedDevice;
+          connectedDevice = nullptr;
+        }
+        currentScreen = SETTINGS_SCREEN;
+        drawSettingsScreen();
+      }
+    }
+  }
+
+  // Handle WiFi client in AP mode
+  if (currentScreen == WIFI_CONFIG_SCREEN) {
+    wifiManager.handleClient();
+  }
+
+  delay(50); // Small delay to prevent touch bounce
+}

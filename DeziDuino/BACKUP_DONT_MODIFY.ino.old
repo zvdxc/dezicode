@@ -1,0 +1,295 @@
+#include <WiFi.h>
+#include <DHT11.h>
+#include <ArduinoJson.h>
+#include <time.h>
+#include <HTTPClient.h>
+#include "creds.h"
+
+// NTP Server settings
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 3600;     // Central European Time (CET) = UTC+1
+const int   daylightOffset_sec = 3600; // Central European Summer Time (CEST) = UTC+2
+
+// Function to check if DST is in effect (for Berlin timezone)
+bool isDST(int year, int month, int day, int hour, int weekday) {
+  // DST starts on last Sunday of March at 2:00 AM
+  if (month < 3 || month > 10) return false;
+  if (month > 3 && month < 10) return true;
+  
+  int previousSunday = day - weekday;
+  
+  // In March, we are DST if previous Sunday was >= 25 (last Sunday of March)
+  if (month == 3) {
+    if (previousSunday >= 25) {
+      // After last Sunday in March
+      return true;
+    } else if (previousSunday < 25) {
+      // Before last Sunday in March
+      return false;
+    } else {
+      // On the last Sunday in March, check if 2:00 AM has passed
+      return (hour >= 2);
+    }
+  }
+  
+  // In October, we are DST if previous Sunday was < 25 (last Sunday of October)
+  if (month == 10) {
+    if (previousSunday < 25) {
+      // Before last Sunday in October
+      return true;
+    } else if (previousSunday > 25) {
+      // After last Sunday in October
+      return false;
+    } else {
+      // On the last Sunday in October, check if 3:00 AM has passed
+      return (hour < 3);
+    }
+  }
+  
+  return false; // Shouldn't reach here
+}
+
+int buzzer = 15;
+int dhtPin = 22;
+// Store last 10 measurements
+const int MAX_MEASUREMENTS = 10;
+int measurementCount = 0;
+StaticJsonDocument<512> doc;  // Adjust size if needed
+JsonArray measurements = doc.to<JsonArray>();
+
+DHT11 dht(dhtPin);
+// Function to get current Unix timestamp
+unsigned long getUnixTime() {
+  time_t now;
+  struct tm timeinfo;
+  if(!getLocalTime(&timeinfo)){
+    Serial.println("Failed to obtain time");
+    return 0;
+  }
+  time(&now);
+  return now;
+}
+
+void setup() {
+
+	pinMode(buzzer, OUTPUT);
+
+	tone(buzzer, 500);
+	delay(500);
+	noTone(buzzer);
+
+
+  digitalWrite(buzzer, HIGH);
+
+  digitalWrite(buzzer, LOW);
+
+	tone(buzzer, 1000);
+	delay(500);
+	noTone(buzzer);
+
+  Serial.begin(115200);
+  Serial.println("Welcome");
+  Serial.println("DeziDuino is starting");
+	tone(buzzer, 500);
+delay(100);
+	noTone(buzzer);
+
+
+  // Initialize WiFi with timeout
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  unsigned long startAttemptTime = millis();
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    // Check if timeout occurred (20 seconds)
+    if (millis() - startAttemptTime > 10000) {
+      Serial.println("\nFailed to connect to WiFi. Rebooting...");
+	tone(buzzer, 500);
+delay(1000);
+noTone(buzzer);
+tone(buzzer, 250);
+delay(1000);
+noTone(buzzer);
+tone(buzzer, 100);
+delay(500);
+      ESP.restart();
+    }
+    
+    delay(500);
+    Serial.print(".");
+	tone(buzzer, 500);
+delay(100);
+noTone(buzzer);
+
+  }
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+	tone(buzzer, 3000);
+delay(700);
+	delay(700);
+	noTone(buzzer);
+  // Initialize time after WiFi is connected
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  
+  // Wait for time to be set
+  Serial.println("Synchronizing time with NTP server...");
+  time_t now = time(nullptr);
+  int retry = 0;
+  while (now < 24 * 3600 && retry++ < 5000) {
+	Serial.print(".");
+    now = time(nullptr);
+    tone(buzzer, 250);
+	delay(100);
+	noTone(buzzer);
+delay(50);
+
+  }
+  
+  // Print current time
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    char timeStringBuff[50];
+    strftime(timeStringBuff, sizeof(timeStringBuff), "%A, %B %d %Y %H:%M:%S", &timeinfo);
+    String timeString = String(timeStringBuff);
+    
+    // Check DST status
+    bool dstActive = isDST(
+      timeinfo.tm_year + 1900, 
+      timeinfo.tm_mon + 1, 
+      timeinfo.tm_mday, 
+      timeinfo.tm_hour,
+      timeinfo.tm_wday
+    );
+    noTone(buzzer);
+    Serial.println("\nTime synchronized: " + timeString);
+    Serial.println("Timezone: Europe/Berlin (" + String(dstActive ? "CEST, DST" : "CET") + ")");
+	tone(buzzer, 5000);
+	delay(200);
+	noTone(buzzer);
+} else {
+noTone(buzzer);
+    Serial.println("\nFailed to obtain time! Using system time.");
+	tone(buzzer, 250);
+	delay(5000);
+	noTone(buzzer);
+}
+
+}
+void loop() {
+Serial.println("DHT11 is measuring");
+// Read temperature from DHT11
+float temperature = dht.readTemperature();
+// For testing (before microphone is shipped) Humidity is equal to decibel value
+if (!isnan(temperature)) {
+  float humidity = dht.readHumidity();
+  
+  // Create a new measurement object with Unix timestamp
+  JsonObject measurement = measurements.createNestedObject();
+  unsigned long currentTime = getUnixTime();
+  measurement["timestamp"] = currentTime ? currentTime : millis();  // Fallback to millis() if NTP fails
+  
+  // Add human-readable time if available
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    char timeStringBuff[20];
+    strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    measurement["datetime"] = String(timeStringBuff);
+    measurement["timezone"] = "Europe/Berlin";
+    measurement["is_dst"] = isDST(
+      timeinfo.tm_year + 1900, 
+      timeinfo.tm_mon + 1, 
+      timeinfo.tm_mday, 
+      timeinfo.tm_hour,
+      timeinfo.tm_wday
+    );
+  }
+  measurement["decibel"] = humidity;  // Using humidity as decibel value
+  measurement["temperature"] = temperature;
+  
+  // Keep only the last 10 measurements
+  if (measurements.size() > MAX_MEASUREMENTS) {
+    measurements.remove(0);
+  }
+  
+  // Print current measurement
+  Serial.print("Current decibel: ");
+  Serial.println(humidity);
+  
+  // Print all measurements in JSON format
+  String jsonOutput;
+  serializeJsonPretty(doc, jsonOutput);
+  Serial.println("All measurements:");
+  Serial.println(jsonOutput);
+  
+    // Increment measurement count
+Serial.print("Previous measurement count: ");
+Serial.println(measurementCount);
+  measurementCount++;
+Serial.print("New measurement count: ");
+Serial.println(measurementCount);
+  
+  // Every 10 measurements, send data to webhook
+  if (measurementCount >= 10) {
+    bool success = sendToWebhook();
+
+    if (success) {
+      // Clear measurements after successful send
+      measurements.clear();
+      measurementCount = 0;
+      Serial.println("Data successfully sent to webhook and local storage cleared");
+    } else {
+      Serial.println("Failed to send data to webhook, will retry next time");
+    }
+  }
+} else {
+  Serial.println("Failed to read from DHT11");
+}
+
+delay(5000);
+}
+
+bool sendToWebhook() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected, cannot send data");
+    return false;
+  }
+
+  HTTPClient http;
+  http.begin(webhookUrl);
+  http.addHeader("Content-Type", "application/json");
+  
+  // Convert measurements to JSON string
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
+  
+  Serial.println("Sending data to webhook...");
+  Serial.println("Payload: " + jsonPayload);
+  
+  // Try up to MAX_RETRIES times
+  for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    int httpResponseCode = http.POST(jsonPayload);
+    
+    if (httpResponseCode > 0) {
+      String response = http.getString();
+      Serial.printf("Webhook response (attempt %d/%d): %d - %s\n", 
+                   attempt, MAX_RETRIES, httpResponseCode, response.c_str());
+      
+      if (httpResponseCode == HTTP_CODE_OK || httpResponseCode == HTTP_CODE_CREATED) {
+        http.end();
+        return true;
+      }
+    } else {
+      Serial.printf("Error sending to webhook (attempt %d/%d): %s\n", 
+                   attempt, MAX_RETRIES, http.errorToString(httpResponseCode).c_str());
+    }
+    
+    if (attempt < MAX_RETRIES) {
+      delay(RETRY_DELAY);
+    }
+  }
+  
+  http.end();
+  return false;
+}
